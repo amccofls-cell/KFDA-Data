@@ -18,7 +18,7 @@ import streamlit.components.v1 as components
 # 의약품 허가정보·약가 통합 조회 — Streamlit version
 # 기존 Colab 노트북의 API 엔드포인트/필드명/매칭 규칙을 유지합니다.
 # ─────────────────────────────────────────────────────────────
-MFDS_LIST_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
+MFDS_LIST_URL = "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
 MFDS_DETAIL_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
 HIRA_PRICE_URL = "https://apis.data.go.kr/B551182/dgamtCrtrInfoService1.2/getDgamtList"
 FIELD_BAR_CODE = "BAR_CODE"
@@ -74,6 +74,7 @@ ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명"]
 RESULT_COLUMN_ORDER = ["허가제품명", "제약사한글명", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
+
 
 DATA_DIR = Path(os.environ.get("DRUG_APP_DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -319,82 +320,31 @@ def split_barcode_values(bar_code_text):
     return values
 
 
+def _excel_engine_for(filename):
+    return "pyxlsb" if filename.lower().endswith(".xlsb") else None
+
+
 def _items_from_body(body):
-    if not isinstance(body, dict):
-        return []
-    items = body.get("items", [])
+    items = body.get("items", []) if isinstance(body, dict) else []
     if isinstance(items, dict):
-        items = items.get("item", items)
+        items = items.get("item", [])
     if isinstance(items, dict):
         items = [items]
     return items or []
 
 
-def _extract_result_meta(data):
-    if not isinstance(data, dict):
-        return "", ""
-    response = data.get("response", data)
-    header = response.get("header", {}) if isinstance(response, dict) else {}
-    body = response.get("body", {}) if isinstance(response, dict) else {}
-    code = header.get("resultCode", "") if isinstance(header, dict) else ""
-    msg = header.get("resultMsg", "") if isinstance(header, dict) else ""
-    if not code and isinstance(body, dict):
-        code = body.get("resultCode", "")
-        msg = body.get("resultMsg", "")
-    return str(code or ""), str(msg or "")
-
-
 def _parse_response_items(resp, api_name):
     resp.raise_for_status()
     text = resp.text.strip()
-    if not text:
-        raise ValueError(f"{api_name}: 빈 응답")
     if text.startswith("<"):
         root = ET.fromstring(text)
-        result_code = root.findtext(".//resultCode") or ""
-        result_msg = root.findtext(".//resultMsg") or ""
+        result_code = root.findtext(".//resultCode")
         if result_code and result_code != "00":
-            raise ValueError(f"{api_name} API 오류({result_code}): {result_msg}")
-        items = []
-        for item_el in root.findall(".//items/item"):
-            row = {}
-            for child in list(item_el):
-                row[child.tag] = child.text or ""
-            items.append(row)
-        return items
-    try:
-        data = resp.json()
-    except ValueError as exc:
-        raise ValueError(f"{api_name}: JSON 파싱 실패: {text[:300]}") from exc
-    code, msg = _extract_result_meta(data)
-    if code and code != "00":
-        raise ValueError(f"{api_name} API 오류({code}): {msg}")
-    response = data.get("response", data) if isinstance(data, dict) else {}
-    body = response.get("body", {}) if isinstance(response, dict) else {}
-    items = _items_from_body(body)
-    if not items and isinstance(data, dict):
-        items = _items_from_body(data.get("body", {}))
-    return items
-
-
-def _nested_doc_text(value):
-    """CDATA/HTML/중첩 XML/일반 텍스트를 최대한 보존해 평문으로 변환."""
-    if not value:
-        return ""
-    raw = unescape_html_repeated(str(value)).strip()
-    if not raw:
-        return ""
-    try:
-        root = ET.fromstring(raw)
-    except ET.ParseError:
-        return clean_markup(raw)
-    parts = []
-    for el in root.iter():
-        if el.get("title"):
-            parts.append(el.get("title"))
-        if el.text and el.text.strip():
-            parts.append(el.text.strip())
-    return clean_markup(" ".join(parts))
+            raise ValueError(f"{api_name} API 오류: {root.findtext('.//resultMsg')}")
+        return [{child.tag: (child.text or "") for child in item_el} for item_el in root.findall(".//items/item")]
+    data = resp.json()
+    body = data.get("body", data.get("response", {}).get("body", {}))
+    return _items_from_body(body)
 
 
 def hira_get(service_key, params):
@@ -478,93 +428,113 @@ def get_effect_classification(item_name, bar_code, service_key, call_counter, ca
     return value
 
 
-def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors, diagnostics=None):
-    """상세 캐시가 불완전하면 반드시 재조회하고, 실패 시 기존 유효값을 보존합니다."""
-    item_seq = str(item_seq or "")
-    cached = cache_detail.get(item_seq, {}) if isinstance(cache_detail.get(item_seq, {}), dict) else {}
-    base_keys = ("성분명", "효능효과", "용법용량")
-    have_base = all(clean_whitespace(cached.get(key, "")) for key in base_keys)
-    missing_extras = [key for key in wanted_extras if not clean_whitespace(cached.get(key, ""))]
-
-    if have_base and not missing_extras and cached.get("_detail_api_ok") is True:
+def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors):
+    cached = cache_detail.get(item_seq, {})
+    have_base = all(clean_whitespace(cached.get(key, "")) for key in ("성분명", "효능효과", "용법용량"))
+    missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
+    if have_base and not missing_extras:
         return cached
-
-    # 이전 캐시에 원문 NB_DOC_DATA가 있으면 추가 필드는 API 재호출 없이 복원
-    if have_base and cached.get("_raw_nb_xml"):
-        for key in list(missing_extras):
+    cached_direct_ready = all(
+        key not in EXTRA_DIRECT_FIELDS or ("_raw_" + key) in cached
+        for key in missing_extras
+    )
+    if have_base and "_raw_nb_xml" in cached and cached_direct_ready:
+        for key in missing_extras:
             if key in EXTRA_DIRECT_FIELDS:
-                raw_key = "_raw_" + key
-                if raw_key in cached:
-                    cached[key] = cached.get(raw_key, "")
-            elif key in EXTRA_FIELD_KEYWORDS:
-                cached[key] = parse_doc_sections(cached.get("_raw_nb_xml", ""), EXTRA_FIELD_KEYWORDS[key])
-        missing_extras = [key for key in wanted_extras if not clean_whitespace(cached.get(key, ""))]
-        if not missing_extras:
-            cached["_detail_api_ok"] = True
-            cache_detail[item_seq] = cached
-            return cached
-
+                cached[key] = cached.get("_raw_" + key, "")
+            else:
+                cached[key] = parse_doc_sections(cached["_raw_nb_xml"], EXTRA_FIELD_KEYWORDS[key])
+        cache_detail[item_seq] = cached
+        return cached
     if call_counter["mfds"] >= MFDS_CALL_LIMIT:
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
-
     call_counter["mfds"] += 1
-    params = {"serviceKey": service_key, "item_seq": item_seq, "type": "json"}
+    params = {
+        "serviceKey": service_key,
+        "item_seq": str(item_seq).strip(),
+        "pageNo": 1,
+        "numOfRows": 1,
+        "type": "json",
+    }
     try:
         resp = requests.get(MFDS_DETAIL_URL, params=params, timeout=30)
+
+        # 오류 원인을 화면에서 확인할 수 있도록 최소 진단정보를 남깁니다.
+        raw = (resp.text or "").strip()
+        api_code = ""
+        api_msg = ""
+        response_format = "XML" if raw.startswith("<") else "JSON"
+        try:
+            if response_format == "XML":
+                root = ET.fromstring(raw)
+                api_code = clean_whitespace(
+                    root.findtext(".//resultCode")
+                    or root.findtext(".//returnReasonCode")
+                    or ""
+                )
+                api_msg = clean_whitespace(
+                    root.findtext(".//resultMsg")
+                    or root.findtext(".//returnReasonMsg")
+                    or ""
+                )
+            else:
+                data = resp.json()
+                body = data.get("body", data.get("response", {}).get("body", {}))
+                header = data.get("header", data.get("response", {}).get("header", {}))
+                api_code = clean_whitespace(
+                    str(header.get("resultCode", body.get("resultCode", "")))
+                )
+                api_msg = clean_whitespace(
+                    str(header.get("resultMsg", body.get("resultMsg", "")))
+                )
+        except Exception:
+            pass
+
+        if api_code and api_code != "00":
+            raise ValueError(
+                f"MFDS 상세 API 오류({api_code}): {api_msg or 'System Error!!'}"
+            )
+
         items = _parse_response_items(resp, "MFDS 상세")
-        diag = {"item_seq": item_seq, "http_status": resp.status_code, "items": len(items)}
-        if diagnostics is not None:
-            diagnostics.append(diag)
         if not items:
-            errors.append(f"MFDS 상세 item_seq={item_seq}: items 없음")
+            errors.append(
+                f"MFDS 상세 item_seq={item_seq}: items 없음 "
+                f"(HTTP {resp.status_code}, {response_format}, resultCode={api_code or '미확인'}, "
+                f"resultMsg={api_msg or '미확인'})"
+            )
             return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
         item = items[0]
-        if diagnostics is not None:
-            diagnostics[-1].update({
-                "성분필드": bool(clean_whitespace(item.get("MAIN_ITEM_INGR", ""))),
-                "효능필드": len(_nested_doc_text(item.get("EE_DOC_DATA", ""))),
-                "용법필드": len(_nested_doc_text(item.get("UD_DOC_DATA", ""))),
-                "NB_DOC_DATA": len(str(item.get("NB_DOC_DATA", "") or "")),
-                "바코드": bool(clean_whitespace(item.get("BAR_CODE", ""))),
-                "EDI": bool(clean_whitespace(item.get("EDI_CODE", ""))),
-            })
     except (requests.RequestException, ValueError, ET.ParseError) as exc:
-        errors.append(f"MFDS 상세 item_seq={item_seq}: {exc}")
-        if diagnostics is not None:
-            diagnostics.append({"item_seq": item_seq, "error": str(exc)})
-        return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
+        errors.append(
+            f"MFDS 상세 item_seq={item_seq}: {exc}"
+        )
+        return cached if cached else {
+            "성분명": "", "효능효과": "", "용법용량": "",
+            "_api_error": str(exc),
+        }
+    nb_xml = item.get("NB_DOC_DATA", "")
+    new_ingredient = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
+    new_effect = parse_nested_doc_xml(item.get("EE_DOC_DATA", ""))
+    new_dose = parse_nested_doc_xml(item.get("UD_DOC_DATA", ""))
 
-    # API 성공 응답에서만 캐시를 갱신합니다. 빈 응답으로 기존 정상값을 덮어쓰지 않습니다.
-    fresh = dict(cached)
-    ingredient = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
-    efficacy = _nested_doc_text(item.get("EE_DOC_DATA", ""))
-    usage = _nested_doc_text(item.get("UD_DOC_DATA", ""))
-    if ingredient:
-        fresh["성분명"] = ingredient
-    if efficacy:
-        fresh["효능효과"] = efficacy
-    if usage:
-        fresh["용법용량"] = usage
-    fresh["_bar_code"] = clean_whitespace(item.get("BAR_CODE", "")) or fresh.get("_bar_code", "")
-    fresh["_edi_code"] = clean_whitespace(item.get("EDI_CODE", "")) or fresh.get("_edi_code", "")
-    nb_xml = item.get("NB_DOC_DATA", "") or fresh.get("_raw_nb_xml", "")
-    fresh["_raw_nb_xml"] = nb_xml
-
+    # API가 성공했더라도 특정 필드가 빈 경우 기존 정상값을 보존합니다.
+    if new_ingredient:
+        cached["성분명"] = new_ingredient
+    if new_effect:
+        cached["효능효과"] = new_effect
+    if new_dose:
+        cached["용법용량"] = new_dose
+    # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
+    cached["_bar_code"] = item.get("BAR_CODE", "")
+    cached["_edi_code"] = item.get("EDI_CODE", "")
+    cached["_raw_nb_xml"] = nb_xml
+    cached["_api_status"] = "success"
     for key, field in EXTRA_DIRECT_FIELDS.items():
-        value = clean_whitespace(item.get(field, ""))
-        if value:
-            fresh["_raw_" + key] = value
+        cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
     for key in wanted_extras:
-        if key in EXTRA_DIRECT_FIELDS:
-            value = fresh.get("_raw_" + key, "")
-        else:
-            value = parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
-        if value:
-            fresh[key] = value
-
-    fresh["_detail_api_ok"] = bool(all(clean_whitespace(fresh.get(k, "")) for k in base_keys))
-    cache_detail[item_seq] = fresh
-    return fresh
+        cached[key] = cached.get("_raw_" + key, "") if key in EXTRA_DIRECT_FIELDS else parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
+    cache_detail[item_seq] = cached
+    return cached
 
 
 def current_kst_date():
@@ -826,7 +796,6 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     cache_meft = load_json_cache(CACHE_MEFT_FILE)
     call_counter = {"hira": 0, "mfds": 0}
     errors = []
-    diagnostics = []
     columns = BASE_COLUMNS + wanted_extras
     output = []
     progress = st.progress(0, text="조회 중입니다…")
@@ -836,7 +805,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
         # 목록 API에는 바코드가 없으므로, 상세 API(fetch_detail)를 먼저 불러 실제 바코드를 얻습니다.
         fetch_keys = list(dict.fromkeys(ALWAYS_FETCH_DETAIL_KEYS + wanted_extras))
-        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors, diagnostics)
+        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors)
         bar_code = detail.get("_bar_code", "")
         price, method = match_price(item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors)
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
@@ -850,133 +819,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     save_json_cache(CACHE_NAME_FILE, cache_name)
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
-    return order_result_columns(pd.DataFrame(output)), errors, diagnostics
-
-
-# ─────────────────────────────────────────────────────────────
-# 비교표 검증 (원본: 의약품 심의자료 검증기 Streamlit v6.2 / app(1).py)
-# 검색·후보 선택·항목 추출은 위쪽 app.py 로직을 그대로 쓰고,
-# 이 블록은 "3번에서 조회한 result_df"를 원문으로 삼아 사용자가 붙여넣은
-# 비교표(심의자료)를 검증하는 기능만 담당한다. 함수명은 위쪽 app.py의
-# 동명 함수(fetch_detail 등)와 절대 겹치지 않도록 cmp_ 접두사를 붙였다.
-# ─────────────────────────────────────────────────────────────
-CMP_SEMANTIC_FIELDS = ["적응증", "용법용량", "소아", "금기"]
-
-# 비교표에서 쓰는 자연스러운 필드명 → 위 app.py가 만드는 result_df의 실제 컬럼명.
-# 값이 None인 항목(제형)은 result_df에 직접 컬럼이 없어 허가제품명에서 규칙 기반으로 추출한다.
-CMP_FIELD_TO_RESULT_COLUMN = {
-    "의약품명": "허가제품명",
-    "성분명": "성분명",
-    "제조판매사": "제약사한글명",
-    "함량": "원료약품및분량",   # "3번 추가 조회 항목"에서 [원료약품 및 분량]을 선택해야 값이 채워진다
-    "제형": None,               # 허가제품명에서 규칙 기반 추출 (아래 cmp_form)
-    "적응증": "효능효과",
-    "용법용량": "용법용량",
-    "소아": "소아_고령자투여",   # "3번"에서 [소아·고령자 투여]를 선택해야 값이 채워진다
-    "보관": "보관정보",         # "3번"에서 [보관정보]를 선택해야 값이 채워진다
-    "금기": "금기사항",         # "3번"에서 [금기사항]을 선택해야 값이 채워진다
-    "약가": "약가",
-}
-# 위 매핑 중 "3번 추가 조회 항목" 체크박스가 있어야만 값이 채워지는 컬럼들.
-# 사용자가 해당 체크박스를 켜지 않았으면 "미조회"임을 명확히 구분해서 안내한다.
-CMP_OPTIONAL_EXTRA_COLUMNS = {"원료약품및분량", "소아_고령자투여", "보관정보", "금기사항"}
-
-
-def cmp_normalize(text):
-    """공백·괄호·중점 등 제거 후 lower() — 제품명 매칭/단순 비교용 (app(1).py의 _normalize)."""
-    if not text:
-        return ""
-    s = re.sub(r"\s+", "", str(text))
-    s = re.sub(r"[\(\)\[\]\{\}_:·,\.\-]", "", s)
-    return s.lower()
-
-
-def cmp_amount(name):
-    """제품명 문자열에서 함량(숫자+단위) 추출 — 함량을 직접 조회하지 않았을 때의 대체 수단."""
-    m = re.search(
-        r"\d+(?:\.\d+)?\s*(?:mg|g|mcg|μg|㎍|IU|mEq|mL|%)\s*(?:/\s*\d+(?:\.\d+)?\s*(?:mg|mL))?",
-        name or "",
-    )
-    return m.group(0).strip() if m else ""
-
-
-_CMP_FORM_MAP = [
-    ("서방정", ["SR", "CR", "XR", "ER", "서방"]),
-    ("캡슐", ["Cap", "Capsule", "캡슐"]),
-    ("주사", ["Inj", "Injection", "주사"]),
-    ("바이알", ["vial", "Vial"]),
-    ("펜", ["pen", "Pen"]),
-    ("현탁액", ["Susp", "susp"]),
-    ("점안액", ["Ophth", "eye"]),
-    ("정", ["Tab", "Tablet", "정"]),
-    ("설하정", ["설하"]),
-]
-
-
-def cmp_form(name):
-    """제품명 문자열에서 제형 추정 — app.py의 result_df에는 제형 컬럼이 따로 없어 항상 이 방식으로 구한다."""
-    for ko, syns in _CMP_FORM_MAP:
-        for s in syns:
-            if s.lower() in (name or "").lower():
-                return ko
-    return ""
-
-
-def parse_compare_table(text):
-    """사용자가 붙여넣은 비교표 텍스트를 파싱한다.
-    한 줄 = '필드명|값', 빈 줄 = 제품 구분. (app(1).py의 parse_compare)"""
-    if not text.strip():
-        return []
-    items, current = [], {}
-    for raw in text.split("\n"):
-        ln = raw.strip()
-        if not ln:
-            if current:
-                items.append(current)
-                current = {}
-            continue
-        if "|" in ln and re.match(r"^[가-힣A-Za-z]", ln):
-            k, v = ln.split("|", 1)
-            k, v = k.strip(), v.strip()
-            if k == "의약품명" and current:
-                items.append(current)
-                current = {}
-            current[k] = v
-        else:
-            current["비고"] = (current.get("비고", "") + " " + ln).strip()
-    if current:
-        items.append(current)
-    return items
-
-
-def compare_one_field(field, table_val, src_val, extra_not_fetched=False):
-    """비교표 기재값(table_val)과 원문값(src_val) 하나를 판정한다. (app(1).py의 compare_one 기반)
-    extra_not_fetched=True면 '3번 추가 조회 항목'을 아예 선택하지 않아 원문 자체를 조회하지
-    않은 상태이므로, 단순 빈 값과 구분해 안내한다."""
-    tv = (table_val or "").strip()
-    sv = (src_val or "").strip()
-    if extra_not_fetched and not sv:
-        return "⚪ 확인 불가", "이 항목은 '3번 추가 조회 항목'에서 선택하지 않아 원문을 조회하지 않았습니다."
-    if not tv and not sv:
-        return "⚪ 확인 불가", "양쪽 모두 비어있음"
-    if not tv:
-        return "🔴 수정 필요", "비교표에 기재 누락"
-    if not sv:
-        return "⚪ 확인 불가", "원문(API)에 해당 항목 값이 비어있음"
-    if field in ("약가", "함량"):
-        tn = re.sub(r"[^\d.]", "", tv)
-        sn = re.sub(r"[^\d.]", "", sv)
-        if not tn or not sn:
-            return "⚪ 확인 불가", "수치 파싱 실패"
-        return ("🟢 일치" if tn == sn else "🔴 수정 필요"), f"비교표={tn}, 원문={sn}"
-    if field in CMP_SEMANTIC_FIELDS:
-        return "🟠 의미 단위 — LLM 확인 필요", "지침에 따른 의미 비교가 필요합니다 (아래 LLM 프롬프트 참고)"
-    tn, sn = cmp_normalize(tv), cmp_normalize(sv)
-    if tn == sn:
-        return "🟢 일치", "정규화 일치"
-    if tn in sn or sn in tn:
-        return "🟡 확인 필요", "정규화 부분 일치 (표현 차이 가능)"
-    return "🔴 수정 필요", f"정규화 불일치: [{tv}] vs [{sv}]"
+    return order_result_columns(pd.DataFrame(output)), errors
 
 
 def match_compare_item_to_result_row(cmp_item, result_df):
@@ -1034,17 +877,11 @@ with st.sidebar:
             if cache_path.exists():
                 cache_path.unlink()
         st.rerun()
-    if st.button("상세 API 캐시 초기화"):
-        if CACHE_DETAIL_FILE.exists():
-            CACHE_DETAIL_FILE.unlink()
-        st.session_state.last_result = None
-        st.session_state.last_errors = []
-        st.session_state.last_diagnostics = []
-        st.rerun()
     st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 파일에 저장하지 않고 Streamlit Secrets/입력값으로만 재사용합니다.")
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
+    st.divider()
 
 
 cache_day = current_kst_date()
@@ -1072,8 +909,6 @@ if "last_result" not in st.session_state:
     st.session_state.last_result = None
 if "last_errors" not in st.session_state:
     st.session_state.last_errors = []
-if "last_diagnostics" not in st.session_state:
-    st.session_state.last_diagnostics = []
 
 st.subheader("1. 의약품 검색")
 query = st.text_input("의약품명 또는 제약사명", placeholder="예: 타이레놀, 한미약품")
@@ -1167,10 +1002,9 @@ summary_view = st.checkbox(
 if st.button("선택한 품목 조회", type="primary", disabled=not st.session_state.selection or not (mfds_key and hira_key)):
     selected_rows = [by_seq[seq] for seq in st.session_state.selection if seq in by_seq]
     with st.spinner("식약처 상세정보와 심평원 약가를 조회하는 중입니다…"):
-        result_df, errors, diagnostics = lookup_selected(selected_rows, mfds_key, hira_key, selected_extras)
+        result_df, errors = lookup_selected(selected_rows, mfds_key, hira_key, selected_extras)
     st.session_state.last_result = result_df
     st.session_state.last_errors = errors
-    st.session_state.last_diagnostics = diagnostics
     st.rerun()
 
 if st.session_state.last_result is not None:
@@ -1299,10 +1133,6 @@ if st.session_state.last_result is not None:
                 file_name=f"비교표검증결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv",
                 key="cmp_csv_download",
             )
-
-    if st.session_state.get("last_diagnostics"):
-        with st.expander("🔎 MFDS 상세 API 진단"):
-            st.dataframe(pd.DataFrame(st.session_state.last_diagnostics), use_container_width=True, hide_index=True)
 
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
