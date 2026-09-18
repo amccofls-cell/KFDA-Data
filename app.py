@@ -942,8 +942,8 @@ def build_cmp_source_value(field, result_row):
 
 
 st.set_page_config(page_title="의약품 통합 조회", page_icon="💊", layout="wide")
-st.title("💊 의약품 허가정보·약가 통합 조회 v3")
-st.caption("식약처 허가·상세정보와 심평원 약가를 결합해 조회합니다. DUR 기능은 제거되었으며, API 실패 결과는 캐시에 저장하지 않습니다.")
+st.title("💊 의약품 허가정보·약가 통합 조회 v.26.09.18")
+st.caption("식약처 허가·상세정보와 심평원 약가를 결합해 조회합니다.")
 
 with st.sidebar:
     st.header("설정")
