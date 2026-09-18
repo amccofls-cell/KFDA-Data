@@ -457,67 +457,77 @@ def _mfds_response_diagnostic(resp):
 
 
 def _request_mfds_detail(item_seq, service_key, permit_date=""):
-    """MFDS 상세 API를 여러 형태로 재시도한다.
+    """MFDS 상세 API를 JSON/XML 양쪽으로 조회하고, 필요 시 허가일자로 fallback한다.
 
-    v3.4 변경점
-    - 공공데이터포털의 APPLICATION_ERROR(01)가 일시적인 GW 오류일 수 있으므로
-      동일 요청을 짧게 재시도한다.
-    - item_seq 직접조회와 허가일자 조회를 분리하고, 허가일자 조회에서는
-      응답의 ITEM_SEQ를 로컬에서 정확히 재매칭한다.
+    v3.5 변경점
+    - v3.4에서 JSON 응답이 반복적으로 APPLICATION_ERROR(01)을 반환하는 현상을
+      확인하여, 같은 상세 API의 XML 응답을 별도 경로로 시도한다.
+    - JSON/XML 모두 HTTPS를 우선 사용하고, 실패 시 HTTP를 보조 경로로 사용한다.
+    - item_seq 직접 조회 실패 시 item_permit_date로 조회하여 ITEM_SEQ를 로컬 매칭한다.
+    - 정상 응답에서만 상세 parser를 수행하며, API 오류 응답은 진단정보로 남긴다.
     - serviceKey는 진단 문자열에 절대 포함하지 않는다.
+
+    주의: XML fallback도 동일한 MFDS 공식 상세 API를 사용한다. 제3자 의약품
+    사이트의 내용을 허가사항 원문으로 대체하지 않는다.
     """
     item_seq = str(item_seq).strip()
     permit_date = re.sub(r"[^0-9]", "", str(permit_date or ""))
 
+    https_url = MFDS_DETAIL_URL
+    http_url = MFDS_DETAIL_URL.replace("https://", "http://", 1)
+
+    # XML은 JSON과 동일한 상세 API의 공식 제공 포맷이므로, JSON에서
+    # APPLICATION_ERROR(01)가 반복될 때 우선적으로 별도 응답 포맷을 시도한다.
     attempts = [
-        (MFDS_DETAIL_URL, {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "json"}, "HTTPS/item_seq"),
-        (MFDS_DETAIL_URL.replace("https://", "http://", 1), {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "json"}, "HTTP/item_seq"),
+        (https_url, {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "json"}, "HTTPS/item_seq/json", False),
+        (https_url, {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "xml"}, "HTTPS/item_seq/xml", False),
+        (http_url, {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "json"}, "HTTP/item_seq/json", False),
+        (http_url, {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "xml"}, "HTTP/item_seq/xml", False),
     ]
     if permit_date:
         attempts.extend([
-            (MFDS_DETAIL_URL, {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTPS/item_permit_date"),
-            (MFDS_DETAIL_URL.replace("https://", "http://", 1), {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTP/item_permit_date"),
+            (https_url, {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTPS/item_permit_date/json", True),
+            (https_url, {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "xml"}, "HTTPS/item_permit_date/xml", True),
+            (http_url, {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTP/item_permit_date/json", True),
+            (http_url, {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "xml"}, "HTTP/item_permit_date/xml", True),
         ])
 
     diagnostics = []
     session = requests.Session()
-    # APPLICATION_ERROR(01) 대응용 짧은 재시도. 한 방식당 최대 2회로 제한해
-    # Streamlit 사용 중 불필요하게 API 호출량이 폭증하지 않도록 한다.
-    max_attempts_per_route = 2
+    headers = {
+        "Accept": "application/json, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+        "User-Agent": "Mozilla/5.0",
+    }
 
-    for url, params, label in attempts:
-        for retry_no in range(1, max_attempts_per_route + 1):
+    # JSON 01은 일시적인 GW 오류일 수 있으므로 1회 재시도한다.
+    # XML은 포맷을 바꾼 독립 경로이므로 기본 1회만 호출한다.
+    for url, params, label, by_date in attempts:
+        retry_count = 2 if label.endswith("/json") else 1
+        for retry_no in range(1, retry_count + 1):
             try:
-                resp = session.get(
-                    url,
-                    params=params,
-                    timeout=(10, 30),
-                    headers={"Accept": "application/json, application/xml;q=0.9, */*;q=0.8", "User-Agent": "Mozilla/5.0"},
-                )
+                resp = session.get(url, params=params, timeout=(10, 30), headers=headers)
                 fmt, code, msg, _preview = _mfds_response_diagnostic(resp)
-                suffix = f" (retry {retry_no}/{max_attempts_per_route})" if retry_no > 1 else ""
+                suffix = f" (retry {retry_no}/{retry_count})" if retry_no > 1 else ""
                 diagnostics.append(
                     f"{label}{suffix}: HTTP {resp.status_code}, {fmt}, "
                     f"resultCode={code or '미확인'}, resultMsg={msg or '미확인'}"
                 )
 
                 if resp.status_code != 200:
-                    if retry_no < max_attempts_per_route:
+                    if retry_no < retry_count:
                         time.sleep(1.2)
                     continue
 
-                # 공공데이터포털 APPLICATION_ERROR(01)는 잠시 후 재호출한다.
                 if code and code != "00":
-                    if retry_no < max_attempts_per_route:
+                    if retry_no < retry_count:
                         time.sleep(1.2)
                     continue
 
                 items = _parse_response_items(resp, "MFDS 상세")
                 if not items:
-                    # 정상 응답이지만 결과가 없으면 같은 route를 반복하지 않는다.
                     break
 
-                if label.endswith("item_permit_date"):
+                if by_date:
                     matches = [
                         it for it in items
                         if str(it.get("ITEM_SEQ", "")).strip() == item_seq
@@ -530,7 +540,7 @@ def _request_mfds_detail(item_seq, service_key, permit_date=""):
 
             except (requests.RequestException, ValueError, ET.ParseError) as exc:
                 diagnostics.append(f"{label}: {type(exc).__name__}: {exc}")
-                if retry_no < max_attempts_per_route:
+                if retry_no < retry_count:
                     time.sleep(1.2)
 
     raise ValueError("MFDS 상세 조회 실패: " + " | ".join(diagnostics))
@@ -569,13 +579,12 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     if call_counter["mfds"] >= MFDS_CALL_LIMIT:
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
 
-    # 한 품목에 대해 직접조회/프로토콜/허가일자 fallback을 묶어 시도한다.
+    # 한 품목에 대해 JSON/XML 직접조회와 허가일자 fallback을 묶어 시도한다.
     # 각 HTTP 요청은 호출한도로 계산한다.
     def request_with_limit():
         if call_counter["mfds"] >= MFDS_CALL_LIMIT:
             raise ValueError("MFDS API 호출 한도에 도달했습니다.")
-        # 상세조회는 내부적으로 최대 8개의 HTTP 요청을 사용할 수 있으므로
-        # 호출량을 보수적으로 예약한다. 실제 사용량보다 크게 잡지 않도록
+        # 상세조회는 내부적으로 여러 HTTP 요청을 사용할 수 있으므로
         # 남은 한도에 따라 허용한다.
         remaining = MFDS_CALL_LIMIT - call_counter["mfds"]
         if remaining < 1:
@@ -583,7 +592,7 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
         result = _request_mfds_detail(item_seq, service_key, permit_date)
         # 실제 시도 횟수를 진단 문자열에서 세어 카운터에 반영한다.
         diagnostics_text = result[1]
-        used = max(1, len(re.findall(r"(?:HTTPS|HTTP)/(?:item_seq|item_permit_date)(?: \(retry \d+/\d+\))?:", diagnostics_text)))
+        used = max(1, len(re.findall(r"(?:HTTPS|HTTP)/(?:item_seq|item_permit_date)/(?:json|xml)(?: \(retry \d+/\d+\))?:", diagnostics_text)))
         call_counter["mfds"] += min(used, remaining)
         return result
 
