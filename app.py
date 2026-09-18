@@ -457,43 +457,82 @@ def _mfds_response_diagnostic(resp):
 
 
 def _request_mfds_detail(item_seq, service_key, permit_date=""):
-    """직접 item_seq 조회가 실패하는 일부 환경을 위해 단계적으로 재시도한다.
-    반환값: (response, diagnostic_text, matched_by_date_fallback)
+    """MFDS 상세 API를 여러 형태로 재시도한다.
+
+    v3.4 변경점
+    - 공공데이터포털의 APPLICATION_ERROR(01)가 일시적인 GW 오류일 수 있으므로
+      동일 요청을 짧게 재시도한다.
+    - item_seq 직접조회와 허가일자 조회를 분리하고, 허가일자 조회에서는
+      응답의 ITEM_SEQ를 로컬에서 정확히 재매칭한다.
+    - serviceKey는 진단 문자열에 절대 포함하지 않는다.
     """
     item_seq = str(item_seq).strip()
     permit_date = re.sub(r"[^0-9]", "", str(permit_date or ""))
+
     attempts = [
         (MFDS_DETAIL_URL, {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "json"}, "HTTPS/item_seq"),
         (MFDS_DETAIL_URL.replace("https://", "http://", 1), {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "json"}, "HTTP/item_seq"),
     ]
-    # 일부 공개데이터 운영환경에서 item_seq 직접 필터가 System Error로 끝나는 경우,
-    # 허가일자 단위 조회 후 ITEM_SEQ를 로컬에서 다시 매칭한다.
     if permit_date:
-        attempts.append((MFDS_DETAIL_URL, {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTPS/item_permit_date"))
-        attempts.append((MFDS_DETAIL_URL.replace("https://", "http://", 1), {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTP/item_permit_date"))
+        attempts.extend([
+            (MFDS_DETAIL_URL, {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTPS/item_permit_date"),
+            (MFDS_DETAIL_URL.replace("https://", "http://", 1), {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTP/item_permit_date"),
+        ])
 
     diagnostics = []
+    session = requests.Session()
+    # APPLICATION_ERROR(01) 대응용 짧은 재시도. 한 방식당 최대 2회로 제한해
+    # Streamlit 사용 중 불필요하게 API 호출량이 폭증하지 않도록 한다.
+    max_attempts_per_route = 2
+
     for url, params, label in attempts:
-        try:
-            resp = requests.get(url, params=params, timeout=30)
-            fmt, code, msg, preview = _mfds_response_diagnostic(resp)
-            diagnostics.append(f"{label}: HTTP {resp.status_code}, {fmt}, resultCode={code or '미확인'}, resultMsg={msg or '미확인'}")
-            if resp.status_code != 200:
-                continue
-            # 오류 응답은 다음 방식으로 넘어간다.
-            if code and code != "00":
-                continue
-            items = _parse_response_items(resp, "MFDS 상세")
-            if not items:
-                continue
-            if label.endswith("item_permit_date"):
-                matches = [it for it in items if str(it.get("ITEM_SEQ", "")).strip() == item_seq]
-                if matches:
-                    return _make_mfds_detail_response(matches[0]), " | ".join(diagnostics), True
-                continue
-            return resp, " | ".join(diagnostics), False
-        except (requests.RequestException, ValueError, ET.ParseError) as exc:
-            diagnostics.append(f"{label}: {type(exc).__name__}: {exc}")
+        for retry_no in range(1, max_attempts_per_route + 1):
+            try:
+                resp = session.get(
+                    url,
+                    params=params,
+                    timeout=(10, 30),
+                    headers={"Accept": "application/json, application/xml;q=0.9, */*;q=0.8", "User-Agent": "Mozilla/5.0"},
+                )
+                fmt, code, msg, _preview = _mfds_response_diagnostic(resp)
+                suffix = f" (retry {retry_no}/{max_attempts_per_route})" if retry_no > 1 else ""
+                diagnostics.append(
+                    f"{label}{suffix}: HTTP {resp.status_code}, {fmt}, "
+                    f"resultCode={code or '미확인'}, resultMsg={msg or '미확인'}"
+                )
+
+                if resp.status_code != 200:
+                    if retry_no < max_attempts_per_route:
+                        time.sleep(1.2)
+                    continue
+
+                # 공공데이터포털 APPLICATION_ERROR(01)는 잠시 후 재호출한다.
+                if code and code != "00":
+                    if retry_no < max_attempts_per_route:
+                        time.sleep(1.2)
+                    continue
+
+                items = _parse_response_items(resp, "MFDS 상세")
+                if not items:
+                    # 정상 응답이지만 결과가 없으면 같은 route를 반복하지 않는다.
+                    break
+
+                if label.endswith("item_permit_date"):
+                    matches = [
+                        it for it in items
+                        if str(it.get("ITEM_SEQ", "")).strip() == item_seq
+                    ]
+                    if matches:
+                        return _make_mfds_detail_response(matches[0]), " | ".join(diagnostics), True
+                    break
+
+                return resp, " | ".join(diagnostics), False
+
+            except (requests.RequestException, ValueError, ET.ParseError) as exc:
+                diagnostics.append(f"{label}: {type(exc).__name__}: {exc}")
+                if retry_no < max_attempts_per_route:
+                    time.sleep(1.2)
+
     raise ValueError("MFDS 상세 조회 실패: " + " | ".join(diagnostics))
 
 
@@ -535,8 +574,18 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     def request_with_limit():
         if call_counter["mfds"] >= MFDS_CALL_LIMIT:
             raise ValueError("MFDS API 호출 한도에 도달했습니다.")
-        call_counter["mfds"] += 1
-        return _request_mfds_detail(item_seq, service_key, permit_date)
+        # 상세조회는 내부적으로 최대 8개의 HTTP 요청을 사용할 수 있으므로
+        # 호출량을 보수적으로 예약한다. 실제 사용량보다 크게 잡지 않도록
+        # 남은 한도에 따라 허용한다.
+        remaining = MFDS_CALL_LIMIT - call_counter["mfds"]
+        if remaining < 1:
+            raise ValueError("MFDS API 호출 한도에 도달했습니다.")
+        result = _request_mfds_detail(item_seq, service_key, permit_date)
+        # 실제 시도 횟수를 진단 문자열에서 세어 카운터에 반영한다.
+        diagnostics_text = result[1]
+        used = max(1, len(re.findall(r"(?:HTTPS|HTTP)/(?:item_seq|item_permit_date)(?: \(retry \d+/\d+\))?:", diagnostics_text)))
+        call_counter["mfds"] += min(used, remaining)
+        return result
 
     try:
         resp, diagnostics, matched_by_date = request_with_limit()
