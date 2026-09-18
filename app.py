@@ -15,11 +15,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ─────────────────────────────────────────────────────────────
-# 의약품 허가정보·약가 통합 조회 — Streamlit v3
-# v3 변경: DUR 기능 완전 제거 + API 실패/빈 응답의 캐시 오염 방지
+# 의약품 허가정보·약가 통합 조회 — Streamlit version
 # 기존 Colab 노트북의 API 엔드포인트/필드명/매칭 규칙을 유지합니다.
 # ─────────────────────────────────────────────────────────────
-MFDS_LIST_URL = "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
+MFDS_LIST_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
 MFDS_DETAIL_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
 HIRA_PRICE_URL = "https://apis.data.go.kr/B551182/dgamtCrtrInfoService1.2/getDgamtList"
 FIELD_BAR_CODE = "BAR_CODE"
@@ -75,7 +74,6 @@ ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명"]
 RESULT_COLUMN_ORDER = ["허가제품명", "제약사한글명", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
-
 
 DATA_DIR = Path(os.environ.get("DRUG_APP_DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -247,35 +245,20 @@ def format_price(value):
 
 
 def load_json_cache(path):
-    """API 캐시를 읽습니다. v2에서 남은 빈 문자열 캐시는 재조회하도록 제거합니다."""
     try:
-        if not path.exists():
-            return {}
-        with path.open("r", encoding="utf-8") as file:
-            value = json.load(file)
-        if not isinstance(value, dict):
-            return {}
-        # 약가/약효분류처럼 top-level value가 문자열인 캐시에서만 빈 값을 제거합니다.
-        # 상세정보(dict)는 fetch_detail()에서 별도로 무결성을 검사합니다.
-        return {
-            key: item for key, item in value.items()
-            if item is not None and not (isinstance(item, str) and not clean_whitespace(item))
-        }
-    except (OSError, json.JSONDecodeError, TypeError):
+        if path.exists():
+            with path.open("r", encoding="utf-8") as file:
+                value = json.load(file)
+                return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
         return {}
+    return {}
 
 
 def save_json_cache(path, data):
-    """캐시를 원자적으로 저장합니다. 빈 문자열/None은 저장하지 않습니다."""
-    if not isinstance(data, dict):
-        return
-    safe_data = {
-        key: item for key, item in data.items()
-        if item is not None and not (isinstance(item, str) and not clean_whitespace(item))
-    }
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as file:
-        json.dump(safe_data, file, ensure_ascii=False, indent=2)
+        json.dump(data, file, ensure_ascii=False, indent=2)
     tmp.replace(path)
 
 
@@ -337,26 +320,81 @@ def split_barcode_values(bar_code_text):
 
 
 def _items_from_body(body):
-    items = body.get("items", []) if isinstance(body, dict) else []
+    if not isinstance(body, dict):
+        return []
+    items = body.get("items", [])
     if isinstance(items, dict):
-        items = items.get("item", [])
+        items = items.get("item", items)
     if isinstance(items, dict):
         items = [items]
     return items or []
 
 
+def _extract_result_meta(data):
+    if not isinstance(data, dict):
+        return "", ""
+    response = data.get("response", data)
+    header = response.get("header", {}) if isinstance(response, dict) else {}
+    body = response.get("body", {}) if isinstance(response, dict) else {}
+    code = header.get("resultCode", "") if isinstance(header, dict) else ""
+    msg = header.get("resultMsg", "") if isinstance(header, dict) else ""
+    if not code and isinstance(body, dict):
+        code = body.get("resultCode", "")
+        msg = body.get("resultMsg", "")
+    return str(code or ""), str(msg or "")
+
+
 def _parse_response_items(resp, api_name):
     resp.raise_for_status()
     text = resp.text.strip()
+    if not text:
+        raise ValueError(f"{api_name}: 빈 응답")
     if text.startswith("<"):
         root = ET.fromstring(text)
-        result_code = root.findtext(".//resultCode")
+        result_code = root.findtext(".//resultCode") or ""
+        result_msg = root.findtext(".//resultMsg") or ""
         if result_code and result_code != "00":
-            raise ValueError(f"{api_name} API 오류: {root.findtext('.//resultMsg')}")
-        return [{child.tag: (child.text or "") for child in item_el} for item_el in root.findall(".//items/item")]
-    data = resp.json()
-    body = data.get("body", data.get("response", {}).get("body", {}))
-    return _items_from_body(body)
+            raise ValueError(f"{api_name} API 오류({result_code}): {result_msg}")
+        items = []
+        for item_el in root.findall(".//items/item"):
+            row = {}
+            for child in list(item_el):
+                row[child.tag] = child.text or ""
+            items.append(row)
+        return items
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise ValueError(f"{api_name}: JSON 파싱 실패: {text[:300]}") from exc
+    code, msg = _extract_result_meta(data)
+    if code and code != "00":
+        raise ValueError(f"{api_name} API 오류({code}): {msg}")
+    response = data.get("response", data) if isinstance(data, dict) else {}
+    body = response.get("body", {}) if isinstance(response, dict) else {}
+    items = _items_from_body(body)
+    if not items and isinstance(data, dict):
+        items = _items_from_body(data.get("body", {}))
+    return items
+
+
+def _nested_doc_text(value):
+    """CDATA/HTML/중첩 XML/일반 텍스트를 최대한 보존해 평문으로 변환."""
+    if not value:
+        return ""
+    raw = unescape_html_repeated(str(value)).strip()
+    if not raw:
+        return ""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return clean_markup(raw)
+    parts = []
+    for el in root.iter():
+        if el.get("title"):
+            parts.append(el.get("title"))
+        if el.text and el.text.strip():
+            parts.append(el.text.strip())
+    return clean_markup(" ".join(parts))
 
 
 def hira_get(service_key, params):
@@ -368,8 +406,9 @@ def hira_get(service_key, params):
 def match_price(item_name, bar_code, service_key, call_counter, cache_code, cache_name, errors):
     key8 = barcode_key8(bar_code)
     if key8:
-        if key8 in cache_code and clean_whitespace(cache_code[key8]):
-            return cache_code[key8], "bar_code_8자리(캐시)"
+        if key8 in cache_code:
+            cached = cache_code[key8]
+            return (cached, "bar_code_8자리(캐시)") if cached else ("", "매칭없음(캐시)")
         if call_counter["hira"] < HIRA_CALL_LIMIT:
             call_counter["hira"] += 1
             try:
@@ -409,7 +448,7 @@ def match_price(item_name, bar_code, service_key, call_counter, cache_code, cach
             exact_name = [it for it in valid if norm(it.get("itmNm")) == name_key]
             if exact_name:
                 cached = exact_name[0].get("mxCprc", "")
-        if call_ok and cached:
+        if call_ok:
             cache_name[name_key] = cached
     if cached:
         return cached, "품목명검색(8자리검증 또는 완전일치)"
@@ -435,63 +474,97 @@ def get_effect_classification(item_name, bar_code, service_key, call_counter, ca
     if key8:
         valid = [item for item in valid if mdscd_key8(item.get("mdsCd")) == key8] or valid
     value = clean_whitespace(valid[0].get(HIRA_MEFT_FIELD, "")) if valid else ""
-    if value:
-        cache_meft[cache_key] = value
+    cache_meft[cache_key] = value
     return value
 
 
-def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors):
-    cached = cache_detail.get(item_seq, {})
-    if not isinstance(cached, dict):
-        cached = {}
-    # v2에서 API 실패/빈 응답이 저장된 상세 캐시는 신뢰하지 않습니다.
-    # 정상 캐시가 없으면 이번 조회에서 다시 MFDS API를 호출합니다.
-    if not any(clean_whitespace(cached.get(key, "")) for key in ("성분명", "효능효과", "용법용량")):
-        cached = {}
-        cache_detail.pop(item_seq, None)
-    have_base = bool(any(clean_whitespace(cached.get(key, "")) for key in ("성분명", "효능효과", "용법용량")))
-    missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
-    if have_base and not missing_extras:
+def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors, diagnostics=None):
+    """상세 캐시가 불완전하면 반드시 재조회하고, 실패 시 기존 유효값을 보존합니다."""
+    item_seq = str(item_seq or "")
+    cached = cache_detail.get(item_seq, {}) if isinstance(cache_detail.get(item_seq, {}), dict) else {}
+    base_keys = ("성분명", "효능효과", "용법용량")
+    have_base = all(clean_whitespace(cached.get(key, "")) for key in base_keys)
+    missing_extras = [key for key in wanted_extras if not clean_whitespace(cached.get(key, ""))]
+
+    if have_base and not missing_extras and cached.get("_detail_api_ok") is True:
         return cached
-    cached_direct_ready = all(
-        key not in EXTRA_DIRECT_FIELDS or ("_raw_" + key) in cached
-        for key in missing_extras
-    )
-    if have_base and "_raw_nb_xml" in cached and cached_direct_ready:
-        for key in missing_extras:
+
+    # 이전 캐시에 원문 NB_DOC_DATA가 있으면 추가 필드는 API 재호출 없이 복원
+    if have_base and cached.get("_raw_nb_xml"):
+        for key in list(missing_extras):
             if key in EXTRA_DIRECT_FIELDS:
-                cached[key] = cached.get("_raw_" + key, "")
-            else:
-                cached[key] = parse_doc_sections(cached["_raw_nb_xml"], EXTRA_FIELD_KEYWORDS[key])
-        cache_detail[item_seq] = cached
-        return cached
+                raw_key = "_raw_" + key
+                if raw_key in cached:
+                    cached[key] = cached.get(raw_key, "")
+            elif key in EXTRA_FIELD_KEYWORDS:
+                cached[key] = parse_doc_sections(cached.get("_raw_nb_xml", ""), EXTRA_FIELD_KEYWORDS[key])
+        missing_extras = [key for key in wanted_extras if not clean_whitespace(cached.get(key, ""))]
+        if not missing_extras:
+            cached["_detail_api_ok"] = True
+            cache_detail[item_seq] = cached
+            return cached
+
     if call_counter["mfds"] >= MFDS_CALL_LIMIT:
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
+
     call_counter["mfds"] += 1
     params = {"serviceKey": service_key, "item_seq": item_seq, "type": "json"}
     try:
-        items = _parse_response_items(requests.get(MFDS_DETAIL_URL, params=params, timeout=30), "MFDS 상세")
+        resp = requests.get(MFDS_DETAIL_URL, params=params, timeout=30)
+        items = _parse_response_items(resp, "MFDS 상세")
+        diag = {"item_seq": item_seq, "http_status": resp.status_code, "items": len(items)}
+        if diagnostics is not None:
+            diagnostics.append(diag)
         if not items:
             errors.append(f"MFDS 상세 item_seq={item_seq}: items 없음")
             return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
         item = items[0]
+        if diagnostics is not None:
+            diagnostics[-1].update({
+                "성분필드": bool(clean_whitespace(item.get("MAIN_ITEM_INGR", ""))),
+                "효능필드": len(_nested_doc_text(item.get("EE_DOC_DATA", ""))),
+                "용법필드": len(_nested_doc_text(item.get("UD_DOC_DATA", ""))),
+                "NB_DOC_DATA": len(str(item.get("NB_DOC_DATA", "") or "")),
+                "바코드": bool(clean_whitespace(item.get("BAR_CODE", ""))),
+                "EDI": bool(clean_whitespace(item.get("EDI_CODE", ""))),
+            })
     except (requests.RequestException, ValueError, ET.ParseError) as exc:
         errors.append(f"MFDS 상세 item_seq={item_seq}: {exc}")
+        if diagnostics is not None:
+            diagnostics.append({"item_seq": item_seq, "error": str(exc)})
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
-    nb_xml = item.get("NB_DOC_DATA", "")
-    cached["성분명"] = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
-    cached["효능효과"] = parse_nested_doc_xml(item.get("EE_DOC_DATA", ""))
-    cached["용법용량"] = parse_nested_doc_xml(item.get("UD_DOC_DATA", ""))
-    # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
-    cached["_bar_code"] = item.get("BAR_CODE", "")
-    cached["_edi_code"] = item.get("EDI_CODE", "")
-    cached["_raw_nb_xml"] = nb_xml
+
+    # API 성공 응답에서만 캐시를 갱신합니다. 빈 응답으로 기존 정상값을 덮어쓰지 않습니다.
+    fresh = dict(cached)
+    ingredient = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
+    efficacy = _nested_doc_text(item.get("EE_DOC_DATA", ""))
+    usage = _nested_doc_text(item.get("UD_DOC_DATA", ""))
+    if ingredient:
+        fresh["성분명"] = ingredient
+    if efficacy:
+        fresh["효능효과"] = efficacy
+    if usage:
+        fresh["용법용량"] = usage
+    fresh["_bar_code"] = clean_whitespace(item.get("BAR_CODE", "")) or fresh.get("_bar_code", "")
+    fresh["_edi_code"] = clean_whitespace(item.get("EDI_CODE", "")) or fresh.get("_edi_code", "")
+    nb_xml = item.get("NB_DOC_DATA", "") or fresh.get("_raw_nb_xml", "")
+    fresh["_raw_nb_xml"] = nb_xml
+
     for key, field in EXTRA_DIRECT_FIELDS.items():
-        cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
+        value = clean_whitespace(item.get(field, ""))
+        if value:
+            fresh["_raw_" + key] = value
     for key in wanted_extras:
-        cached[key] = cached.get("_raw_" + key, "") if key in EXTRA_DIRECT_FIELDS else parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
-    cache_detail[item_seq] = cached
-    return cached
+        if key in EXTRA_DIRECT_FIELDS:
+            value = fresh.get("_raw_" + key, "")
+        else:
+            value = parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
+        if value:
+            fresh[key] = value
+
+    fresh["_detail_api_ok"] = bool(all(clean_whitespace(fresh.get(k, "")) for k in base_keys))
+    cache_detail[item_seq] = fresh
+    return fresh
 
 
 def current_kst_date():
@@ -753,6 +826,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     cache_meft = load_json_cache(CACHE_MEFT_FILE)
     call_counter = {"hira": 0, "mfds": 0}
     errors = []
+    diagnostics = []
     columns = BASE_COLUMNS + wanted_extras
     output = []
     progress = st.progress(0, text="조회 중입니다…")
@@ -762,7 +836,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
         # 목록 API에는 바코드가 없으므로, 상세 API(fetch_detail)를 먼저 불러 실제 바코드를 얻습니다.
         fetch_keys = list(dict.fromkeys(ALWAYS_FETCH_DETAIL_KEYS + wanted_extras))
-        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors)
+        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors, diagnostics)
         bar_code = detail.get("_bar_code", "")
         price, method = match_price(item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors)
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
@@ -776,8 +850,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     save_json_cache(CACHE_NAME_FILE, cache_name)
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
-    return order_result_columns(pd.DataFrame(output)), errors
-
+    return order_result_columns(pd.DataFrame(output)), errors, diagnostics
 
 
 # ─────────────────────────────────────────────────────────────
@@ -942,8 +1015,8 @@ def build_cmp_source_value(field, result_row):
 
 
 st.set_page_config(page_title="의약품 통합 조회", page_icon="💊", layout="wide")
-st.title("💊 의약품 허가정보·약가 통합 조회 v.26.09.18")
-st.caption("식약처 허가·상세정보와 심평원 약가를 결합해 조회합니다.")
+st.title("💊 의약품 허가정보·약가 통합 조회")
+st.caption("식약처 허가·상세정보와 심평원 약가를 결합해 조회합니다. 데이터의 기준일과 API 응답을 함께 확인하세요.")
 
 with st.sidebar:
     st.header("설정")
@@ -961,21 +1034,14 @@ with st.sidebar:
             if cache_path.exists():
                 cache_path.unlink()
         st.rerun()
-    st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 파일에 저장하지 않고 Streamlit Secrets/입력값으로만 재사용합니다.")
-    st.divider()
-    st.markdown("**API 캐시 관리 (v3)**")
-    st.caption("빈/실패 캐시는 자동으로 무시합니다. 정상 캐시는 유지됩니다.")
-    if st.button("API 빈 캐시 정리"):
-        for cache_path in (CACHE_CODE_FILE, CACHE_NAME_FILE, CACHE_DETAIL_FILE, CACHE_MEFT_FILE):
-            save_json_cache(cache_path, load_json_cache(cache_path))
-        st.success("빈/오염 캐시를 정리했습니다.")
-    if st.button("API 캐시 전체 초기화"):
-        for cache_path in (CACHE_CODE_FILE, CACHE_NAME_FILE, CACHE_DETAIL_FILE, CACHE_MEFT_FILE):
-            if cache_path.exists():
-                cache_path.unlink()
+    if st.button("상세 API 캐시 초기화"):
+        if CACHE_DETAIL_FILE.exists():
+            CACHE_DETAIL_FILE.unlink()
         st.session_state.last_result = None
         st.session_state.last_errors = []
+        st.session_state.last_diagnostics = []
         st.rerun()
+    st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 파일에 저장하지 않고 Streamlit Secrets/입력값으로만 재사용합니다.")
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
@@ -1006,6 +1072,8 @@ if "last_result" not in st.session_state:
     st.session_state.last_result = None
 if "last_errors" not in st.session_state:
     st.session_state.last_errors = []
+if "last_diagnostics" not in st.session_state:
+    st.session_state.last_diagnostics = []
 
 st.subheader("1. 의약품 검색")
 query = st.text_input("의약품명 또는 제약사명", placeholder="예: 타이레놀, 한미약품")
@@ -1099,9 +1167,10 @@ summary_view = st.checkbox(
 if st.button("선택한 품목 조회", type="primary", disabled=not st.session_state.selection or not (mfds_key and hira_key)):
     selected_rows = [by_seq[seq] for seq in st.session_state.selection if seq in by_seq]
     with st.spinner("식약처 상세정보와 심평원 약가를 조회하는 중입니다…"):
-        result_df, errors = lookup_selected(selected_rows, mfds_key, hira_key, selected_extras)
+        result_df, errors, diagnostics = lookup_selected(selected_rows, mfds_key, hira_key, selected_extras)
     st.session_state.last_result = result_df
     st.session_state.last_errors = errors
+    st.session_state.last_diagnostics = diagnostics
     st.rerun()
 
 if st.session_state.last_result is not None:
@@ -1230,6 +1299,10 @@ if st.session_state.last_result is not None:
                 file_name=f"비교표검증결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv",
                 key="cmp_csv_download",
             )
+
+    if st.session_state.get("last_diagnostics"):
+        with st.expander("🔎 MFDS 상세 API 진단"):
+            st.dataframe(pd.DataFrame(st.session_state.last_diagnostics), use_container_width=True, hide_index=True)
 
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
