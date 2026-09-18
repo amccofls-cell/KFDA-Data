@@ -822,6 +822,126 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
     return order_result_columns(pd.DataFrame(output)), errors
 
 
+CMP_SEMANTIC_FIELDS = ["적응증", "용법용량", "소아", "금기"]
+
+# 비교표에서 쓰는 자연스러운 필드명 → 위 app.py가 만드는 result_df의 실제 컬럼명.
+# 값이 None인 항목(제형)은 result_df에 직접 컬럼이 없어 허가제품명에서 규칙 기반으로 추출한다.
+CMP_FIELD_TO_RESULT_COLUMN = {
+    "의약품명": "허가제품명",
+    "성분명": "성분명",
+    "제조판매사": "제약사한글명",
+    "함량": "원료약품및분량",   # "3번 추가 조회 항목"에서 [원료약품 및 분량]을 선택해야 값이 채워진다
+    "제형": None,               # 허가제품명에서 규칙 기반 추출 (아래 cmp_form)
+    "적응증": "효능효과",
+    "용법용량": "용법용량",
+    "소아": "소아_고령자투여",   # "3번"에서 [소아·고령자 투여]를 선택해야 값이 채워진다
+    "보관": "보관정보",         # "3번"에서 [보관정보]를 선택해야 값이 채워진다
+    "금기": "금기사항",         # "3번"에서 [금기사항]을 선택해야 값이 채워진다
+    "약가": "약가",
+}
+# 위 매핑 중 "3번 추가 조회 항목" 체크박스가 있어야만 값이 채워지는 컬럼들.
+# 사용자가 해당 체크박스를 켜지 않았으면 "미조회"임을 명확히 구분해서 안내한다.
+CMP_OPTIONAL_EXTRA_COLUMNS = {"원료약품및분량", "소아_고령자투여", "보관정보", "금기사항"}
+
+
+def cmp_normalize(text):
+    """공백·괄호·중점 등 제거 후 lower() — 제품명 매칭/단순 비교용 (app(1).py의 _normalize)."""
+    if not text:
+        return ""
+    s = re.sub(r"\s+", "", str(text))
+    s = re.sub(r"[\(\)\[\]\{\}_:·,\.\-]", "", s)
+    return s.lower()
+
+
+def cmp_amount(name):
+    """제품명 문자열에서 함량(숫자+단위) 추출 — 함량을 직접 조회하지 않았을 때의 대체 수단."""
+    m = re.search(
+        r"\d+(?:\.\d+)?\s*(?:mg|g|mcg|μg|㎍|IU|mEq|mL|%)\s*(?:/\s*\d+(?:\.\d+)?\s*(?:mg|mL))?",
+        name or "",
+    )
+    return m.group(0).strip() if m else ""
+
+
+_CMP_FORM_MAP = [
+    ("서방정", ["SR", "CR", "XR", "ER", "서방"]),
+    ("캡슐", ["Cap", "Capsule", "캡슐"]),
+    ("주사", ["Inj", "Injection", "주사"]),
+    ("바이알", ["vial", "Vial"]),
+    ("펜", ["pen", "Pen"]),
+    ("현탁액", ["Susp", "susp"]),
+    ("점안액", ["Ophth", "eye"]),
+    ("정", ["Tab", "Tablet", "정"]),
+    ("설하정", ["설하"]),
+]
+
+
+def cmp_form(name):
+    """제품명 문자열에서 제형 추정 — app.py의 result_df에는 제형 컬럼이 따로 없어 항상 이 방식으로 구한다."""
+    for ko, syns in _CMP_FORM_MAP:
+        for s in syns:
+            if s.lower() in (name or "").lower():
+                return ko
+    return ""
+
+
+def parse_compare_table(text):
+    """사용자가 붙여넣은 비교표 텍스트를 파싱한다.
+    한 줄 = '필드명|값', 빈 줄 = 제품 구분. (app(1).py의 parse_compare)"""
+    if not text.strip():
+        return []
+    items, current = [], {}
+    for raw in text.split("\n"):
+        ln = raw.strip()
+        if not ln:
+            if current:
+                items.append(current)
+                current = {}
+            continue
+        if "|" in ln and re.match(r"^[가-힣A-Za-z]", ln):
+            k, v = ln.split("|", 1)
+            k, v = k.strip(), v.strip()
+            if k == "의약품명" and current:
+                items.append(current)
+                current = {}
+            current[k] = v
+        else:
+            current["비고"] = (current.get("비고", "") + " " + ln).strip()
+    if current:
+        items.append(current)
+    return items
+
+
+def compare_one_field(field, table_val, src_val, extra_not_fetched=False):
+    """비교표 기재값(table_val)과 원문값(src_val) 하나를 판정한다. (app(1).py의 compare_one 기반)
+    extra_not_fetched=True면 '3번 추가 조회 항목'을 아예 선택하지 않아 원문 자체를 조회하지
+    않은 상태이므로, 단순 빈 값과 구분해 안내한다."""
+    tv = (table_val or "").strip()
+    sv = (src_val or "").strip()
+    if extra_not_fetched and not sv:
+        return "⚪ 확인 불가", "이 항목은 '3번 추가 조회 항목'에서 선택하지 않아 원문을 조회하지 않았습니다."
+    if not tv and not sv:
+        return "⚪ 확인 불가", "양쪽 모두 비어있음"
+    if not tv:
+        return "🔴 수정 필요", "비교표에 기재 누락"
+    if not sv:
+        return "⚪ 확인 불가", "원문(API)에 해당 항목 값이 비어있음"
+    if field in ("약가", "함량"):
+        tn = re.sub(r"[^\d.]", "", tv)
+        sn = re.sub(r"[^\d.]", "", sv)
+        if not tn or not sn:
+            return "⚪ 확인 불가", "수치 파싱 실패"
+        return ("🟢 일치" if tn == sn else "🔴 수정 필요"), f"비교표={tn}, 원문={sn}"
+    if field in CMP_SEMANTIC_FIELDS:
+        return "🟠 의미 단위 — LLM 확인 필요", "지침에 따른 의미 비교가 필요합니다 (아래 LLM 프롬프트 참고)"
+    tn, sn = cmp_normalize(tv), cmp_normalize(sv)
+    if tn == sn:
+        return "🟢 일치", "정규화 일치"
+    if tn in sn or sn in tn:
+        return "🟡 확인 필요", "정규화 부분 일치 (표현 차이 가능)"
+    return "🔴 수정 필요", f"정규화 불일치: [{tv}] vs [{sv}]"
+
+
+
 def match_compare_item_to_result_row(cmp_item, result_df):
     """비교표 항목의 '의약품명'을 result_df(3번에서 조회한 원문)의 허가제품명과 매칭한다."""
     name = cmp_normalize(cmp_item.get("의약품명", ""))
