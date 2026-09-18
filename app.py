@@ -1081,21 +1081,73 @@ st.caption("식약처 허가·상세정보와 심평원 약가를 결합해 조�
 
 with st.sidebar:
     st.header("설정")
-    st.markdown("API 키는 코드에 저장하지 말고 아래 입력란 또는 Streamlit secrets를 사용하세요.")
     try:
-        secret_mfds = st.secrets.get("MFDS_KEY", "")
-        secret_hira = st.secrets.get("HIRA_KEY", "")
+        secret_mfds = str(st.secrets.get("MFDS_KEY", "") or "")
+        secret_hira = str(st.secrets.get("HIRA_KEY", "") or "")
+        admin_password = str(st.secrets.get("ADMIN_PASSWORD", "") or "")
     except Exception:
-        secret_mfds, secret_hira = "", ""
-    mfds_key = st.text_input("식약처 인증키 (디코딩된 키)", value=secret_mfds, type="password")
-    hira_key = st.text_input("심평원 인증키 (디코딩된 키)", value=secret_hira, type="password")
+        secret_mfds, secret_hira, admin_password = "", "", ""
+
+    # API 인증키는 관리자만 입력/수정할 수 있도록 합니다.
+    # 관리자 비밀번호는 Streamlit Secrets의 ADMIN_PASSWORD에만 저장합니다.
+    if "admin_authenticated" not in st.session_state:
+        st.session_state.admin_authenticated = False
+
+    st.markdown("**관리자 설정**")
+    if admin_password:
+        if not st.session_state.admin_authenticated:
+            admin_pw = st.text_input("관리자 비밀번호", type="password", key="admin_login_pw")
+            if st.button("관리자 로그인", use_container_width=True):
+                if admin_pw == admin_password:
+                    st.session_state.admin_authenticated = True
+                    st.rerun()
+                else:
+                    st.error("관리자 비밀번호가 올바르지 않습니다.")
+            st.caption("API 인증키 입력/수정은 관리자 로그인 후에만 가능합니다.")
+        else:
+            st.success("관리자 모드")
+            if st.button("관리자 로그아웃", use_container_width=True):
+                st.session_state.admin_authenticated = False
+                # 세션에 임시 입력된 인증키도 함께 제거합니다.
+                st.session_state.pop("mfds_key_input", None)
+                st.session_state.pop("hira_key_input", None)
+                st.rerun()
+    else:
+        st.warning("관리자 비밀번호가 설정되지 않았습니다. Streamlit Secrets에 ADMIN_PASSWORD를 등록하세요.")
+
+    if st.session_state.admin_authenticated:
+        st.divider()
+        st.markdown("**API 인증키**")
+        st.caption("디코딩된 인증키는 관리자에게만 표시/입력됩니다. 일반 사용자는 인증키 자체를 볼 수 없습니다.")
+        mfds_key = st.text_input(
+            "식약처 인증키 (디코딩된 키)",
+            value=secret_mfds,
+            type="password",
+            key="mfds_key_input",
+        )
+        hira_key = st.text_input(
+            "심평원 인증키 (디코딩된 키)",
+            value=secret_hira,
+            type="password",
+            key="hira_key_input",
+        )
+    else:
+        # 일반 사용자에게는 인증키 입력란 자체를 노출하지 않습니다.
+        mfds_key = secret_mfds
+        hira_key = secret_hira
+        st.info("API 인증키는 관리자 설정으로 보호되어 있습니다.")
+
     if st.button("허가목록 캐시 새로고침"):
-        st.cache_data.clear()
-        for cache_path in (LIST_FILE, LIST_META_FILE, TEMP_FILE):
-            if cache_path.exists():
-                cache_path.unlink()
-        st.rerun()
-    st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 파일에 저장하지 않고 Streamlit Secrets/입력값으로만 재사용합니다.")
+        if st.session_state.admin_authenticated:
+            st.cache_data.clear()
+            for cache_path in (LIST_FILE, LIST_META_FILE, TEMP_FILE):
+                if cache_path.exists():
+                    cache_path.unlink()
+            st.rerun()
+        else:
+            st.warning("허가목록 캐시 새로고침은 관리자만 사용할 수 있습니다.")
+
+    st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 코드에 저장하지 않고 Streamlit Secrets/관리자 세션으로만 사용합니다.")
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
