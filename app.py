@@ -428,7 +428,88 @@ def get_effect_classification(item_name, bar_code, service_key, call_counter, ca
     return value
 
 
-def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors):
+def _mfds_response_diagnostic(resp):
+    """MFDS 응답에서 오류코드/메시지를 안전하게 추출한다. serviceKey는 절대 반환하지 않는다."""
+    raw = (resp.text or "").strip()
+    api_code = ""
+    api_msg = ""
+    fmt = "XML" if raw.startswith("<") else "JSON"
+    try:
+        if fmt == "XML":
+            root = ET.fromstring(raw)
+            api_code = clean_whitespace(root.findtext(".//resultCode") or root.findtext(".//returnReasonCode") or "")
+            api_msg = clean_whitespace(root.findtext(".//resultMsg") or root.findtext(".//returnReasonMsg") or "")
+        else:
+            data = resp.json()
+            response = data.get("response", {}) if isinstance(data, dict) else {}
+            body = data.get("body", response.get("body", {})) if isinstance(data, dict) else {}
+            header = data.get("header", response.get("header", {})) if isinstance(data, dict) else {}
+            api_code = clean_whitespace(str(header.get("resultCode", body.get("resultCode", ""))))
+            api_msg = clean_whitespace(str(header.get("resultMsg", body.get("resultMsg", ""))))
+            if not api_code and isinstance(data, dict):
+                cmm = data.get("OpenAPI_ServiceResponse", {}).get("cmmMsgHeader", {})
+                api_code = clean_whitespace(str(cmm.get("returnReasonCode", "")))
+                api_msg = clean_whitespace(str(cmm.get("returnAuthMsg", cmm.get("returnReasonMsg", ""))))
+    except Exception:
+        pass
+    preview = re.sub(r"(?i)(serviceKey|ServiceKey)=?[^&\\s]+", r"\1=[REDACTED]", raw[:1200])
+    return fmt, api_code, api_msg, preview
+
+
+def _request_mfds_detail(item_seq, service_key, permit_date=""):
+    """직접 item_seq 조회가 실패하는 일부 환경을 위해 단계적으로 재시도한다.
+    반환값: (response, diagnostic_text, matched_by_date_fallback)
+    """
+    item_seq = str(item_seq).strip()
+    permit_date = re.sub(r"[^0-9]", "", str(permit_date or ""))
+    attempts = [
+        (MFDS_DETAIL_URL, {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "json"}, "HTTPS/item_seq"),
+        (MFDS_DETAIL_URL.replace("https://", "http://", 1), {"serviceKey": service_key, "item_seq": item_seq, "pageNo": 1, "numOfRows": 1, "type": "json"}, "HTTP/item_seq"),
+    ]
+    # 일부 공개데이터 운영환경에서 item_seq 직접 필터가 System Error로 끝나는 경우,
+    # 허가일자 단위 조회 후 ITEM_SEQ를 로컬에서 다시 매칭한다.
+    if permit_date:
+        attempts.append((MFDS_DETAIL_URL, {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTPS/item_permit_date"))
+        attempts.append((MFDS_DETAIL_URL.replace("https://", "http://", 1), {"serviceKey": service_key, "item_permit_date": permit_date, "pageNo": 1, "numOfRows": 100, "type": "json"}, "HTTP/item_permit_date"))
+
+    diagnostics = []
+    for url, params, label in attempts:
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            fmt, code, msg, preview = _mfds_response_diagnostic(resp)
+            diagnostics.append(f"{label}: HTTP {resp.status_code}, {fmt}, resultCode={code or '미확인'}, resultMsg={msg or '미확인'}")
+            if resp.status_code != 200:
+                continue
+            # 오류 응답은 다음 방식으로 넘어간다.
+            if code and code != "00":
+                continue
+            items = _parse_response_items(resp, "MFDS 상세")
+            if not items:
+                continue
+            if label.endswith("item_permit_date"):
+                matches = [it for it in items if str(it.get("ITEM_SEQ", "")).strip() == item_seq]
+                if matches:
+                    return _make_mfds_detail_response(matches[0]), " | ".join(diagnostics), True
+                continue
+            return resp, " | ".join(diagnostics), False
+        except (requests.RequestException, ValueError, ET.ParseError) as exc:
+            diagnostics.append(f"{label}: {type(exc).__name__}: {exc}")
+    raise ValueError("MFDS 상세 조회 실패: " + " | ".join(diagnostics))
+
+
+def _make_mfds_detail_response(item):
+    """로컬 매칭한 item을 _parse_response_items와 동일하게 소비할 수 있도록 응답 객체를 만든다."""
+    class _LocalResponse:
+        status_code = 200
+        text = ""
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"body": {"items": [item]}}
+    return _LocalResponse()
+
+
+def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors, permit_date=""):
     cached = cache_detail.get(item_seq, {})
     have_base = all(clean_whitespace(cached.get(key, "")) for key in ("성분명", "효능효과", "용법용량"))
     missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
@@ -448,87 +529,46 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
         return cached
     if call_counter["mfds"] >= MFDS_CALL_LIMIT:
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
-    call_counter["mfds"] += 1
-    params = {
-        "serviceKey": service_key,
-        "item_seq": str(item_seq).strip(),
-        "pageNo": 1,
-        "numOfRows": 1,
-        "type": "json",
-    }
+
+    # 한 품목에 대해 직접조회/프로토콜/허가일자 fallback을 묶어 시도한다.
+    # 각 HTTP 요청은 호출한도로 계산한다.
+    def request_with_limit():
+        if call_counter["mfds"] >= MFDS_CALL_LIMIT:
+            raise ValueError("MFDS API 호출 한도에 도달했습니다.")
+        call_counter["mfds"] += 1
+        return _request_mfds_detail(item_seq, service_key, permit_date)
+
     try:
-        resp = requests.get(MFDS_DETAIL_URL, params=params, timeout=30)
-
-        # 오류 원인을 화면에서 확인할 수 있도록 최소 진단정보를 남깁니다.
-        raw = (resp.text or "").strip()
-        api_code = ""
-        api_msg = ""
-        response_format = "XML" if raw.startswith("<") else "JSON"
-        try:
-            if response_format == "XML":
-                root = ET.fromstring(raw)
-                api_code = clean_whitespace(
-                    root.findtext(".//resultCode")
-                    or root.findtext(".//returnReasonCode")
-                    or ""
-                )
-                api_msg = clean_whitespace(
-                    root.findtext(".//resultMsg")
-                    or root.findtext(".//returnReasonMsg")
-                    or ""
-                )
-            else:
-                data = resp.json()
-                body = data.get("body", data.get("response", {}).get("body", {}))
-                header = data.get("header", data.get("response", {}).get("header", {}))
-                api_code = clean_whitespace(
-                    str(header.get("resultCode", body.get("resultCode", "")))
-                )
-                api_msg = clean_whitespace(
-                    str(header.get("resultMsg", body.get("resultMsg", "")))
-                )
-        except Exception:
-            pass
-
-        if api_code and api_code != "00":
-            raise ValueError(
-                f"MFDS 상세 API 오류({api_code}): {api_msg or 'System Error!!'}"
-            )
-
+        resp, diagnostics, matched_by_date = request_with_limit()
         items = _parse_response_items(resp, "MFDS 상세")
         if not items:
-            errors.append(
-                f"MFDS 상세 item_seq={item_seq}: items 없음 "
-                f"(HTTP {resp.status_code}, {response_format}, resultCode={api_code or '미확인'}, "
-                f"resultMsg={api_msg or '미확인'})"
-            )
-            return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
+            raise ValueError(f"items 없음 ({diagnostics})")
         item = items[0]
+        if matched_by_date and str(item.get("ITEM_SEQ", "")).strip() != str(item_seq).strip():
+            raise ValueError(f"허가일자 fallback 매칭 실패 (요청 item_seq={item_seq})")
     except (requests.RequestException, ValueError, ET.ParseError) as exc:
-        errors.append(
-            f"MFDS 상세 item_seq={item_seq}: {exc}"
-        )
-        return cached if cached else {
-            "성분명": "", "효능효과": "", "용법용량": "",
-            "_api_error": str(exc),
-        }
+        # 기존 정상 캐시는 보존하고, 오류는 상세 진단을 남긴다.
+        msg = str(exc)
+        errors.append(f"MFDS 상세 item_seq={item_seq}: {msg}")
+        cached["_api_error"] = msg
+        cache_detail[item_seq] = cached
+        return cached if cached else {"성분명": "", "효능효과": "", "용법용량": "", "_api_error": msg}
+
     nb_xml = item.get("NB_DOC_DATA", "")
     new_ingredient = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
     new_effect = parse_nested_doc_xml(item.get("EE_DOC_DATA", ""))
     new_dose = parse_nested_doc_xml(item.get("UD_DOC_DATA", ""))
-
-    # API가 성공했더라도 특정 필드가 빈 경우 기존 정상값을 보존합니다.
     if new_ingredient:
         cached["성분명"] = new_ingredient
     if new_effect:
         cached["효능효과"] = new_effect
     if new_dose:
         cached["용법용량"] = new_dose
-    # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
     cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_edi_code"] = item.get("EDI_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
-    cached["_api_status"] = "success"
+    cached["_api_status"] = "success_fallback" if matched_by_date else "success"
+    cached.pop("_api_error", None)
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
     for key in wanted_extras:
@@ -805,7 +845,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras):
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
         # 목록 API에는 바코드가 없으므로, 상세 API(fetch_detail)를 먼저 불러 실제 바코드를 얻습니다.
         fetch_keys = list(dict.fromkeys(ALWAYS_FETCH_DETAIL_KEYS + wanted_extras))
-        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors)
+        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors, row.get("ITEM_PERMIT_DATE", ""))
         bar_code = detail.get("_bar_code", "")
         price, method = match_price(item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors)
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
